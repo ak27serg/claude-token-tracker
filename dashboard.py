@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Allow running from any directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,13 +29,23 @@ from tracker.db import (
     query_daily,
     query_models,
     query_projects,
+    query_rolling_window,
     query_sessions,
     query_session_turns,
     query_today,
     query_totals,
+    upsert_turns_bulk,
 )
 from tracker.parser import scan_all_turns
-from tracker.db import upsert_turns_bulk
+from tracker.config import (
+    PLAN_LIMITS,
+    PLAN_NAMES,
+    PLANS,
+    cycle_plan,
+    get_limit,
+    get_plan,
+    set_plan,
+)
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -163,6 +173,68 @@ class StatsBanner(Static):
             f"{all_sessions} sessions | {all_turns} turns"
             f"    [bold]Today:[/bold] {_fmt_tokens(today_tok)} tokens | "
             f"{_fmt_cost(today_cost)} | {today_sessions} sessions"
+        )
+        self.update(text)
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit progress bar
+# ---------------------------------------------------------------------------
+
+class RateLimitBar(Static):
+    """Shows token usage relative to the plan's 5-hour rolling window limit."""
+
+    DEFAULT_CSS = """
+    RateLimitBar {
+        padding: 1 2;
+        background: $panel;
+        color: $text;
+        border-bottom: solid $accent;
+    }
+    """
+
+    def update_bar(self, window: dict, plan: str, limit: int) -> None:
+        output_tokens = window.get("output_tokens") or 0
+        pct = min(output_tokens / limit, 1.0) if limit else 0
+        pct_display = pct * 100
+
+        # Color based on usage
+        if pct < 0.60:
+            color = "green"
+        elif pct < 0.85:
+            color = "yellow"
+        else:
+            color = "red"
+
+        # Progress bar (30 chars wide)
+        bar_width = 30
+        filled = int(pct * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        # Estimate when the window resets
+        oldest = window.get("oldest_turn")
+        reset_text = ""
+        if oldest and output_tokens > 0:
+            try:
+                oldest_dt = datetime.fromisoformat(oldest.replace("Z", "+00:00"))
+                # The oldest turn falls off after 5 hours
+                reset_at = oldest_dt + timedelta(hours=5)
+                now = datetime.now(timezone.utc)
+                remaining = reset_at - now
+                if remaining.total_seconds() > 0:
+                    hrs, rem = divmod(int(remaining.total_seconds()), 3600)
+                    mins = rem // 60
+                    reset_text = f" · resets in ~{hrs}h{mins:02d}m"
+            except (ValueError, TypeError):
+                pass
+
+        plan_name = PLAN_NAMES.get(plan, plan)
+        text = (
+            f"[bold]Rate limit[/bold] \\[{plan_name}]  "
+            f"[{color}]{bar}[/{color}]  "
+            f"{_fmt_tokens(output_tokens)} / {_fmt_tokens(limit)} output tokens "
+            f"({pct_display:.0f}%){reset_text}"
+            f"    [dim]P to switch plan[/dim]"
         )
         self.update(text)
 
@@ -342,6 +414,15 @@ class TokenTrackerApp(App):
     CSS = """
     Screen {
         background: $surface;
+        layout: vertical;
+    }
+    #stats-banner {
+        height: auto;
+        min-height: 3;
+    }
+    #rate-limit-bar {
+        height: auto;
+        min-height: 3;
     }
     TabbedContent {
         height: 1fr;
@@ -366,11 +447,12 @@ class TokenTrackerApp(App):
 
     BINDINGS = [
         Binding("r,f5", "refresh", "Refresh"),
+        Binding("p", "cycle_plan", "Switch plan"),
         Binding("q,Q", "quit", "Quit"),
     ]
 
     TITLE = "Claude Token Tracker"
-    SUB_TITLE = "↑↓ navigate · Enter drill-down · R refresh · Q quit"
+    SUB_TITLE = "↑↓ navigate · Enter drill-down · R refresh · P plan · Q quit"
 
     # Internal state
     _sessions_data: list[dict] = []
@@ -379,6 +461,7 @@ class TokenTrackerApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield StatsBanner(id="stats-banner")
+        yield RateLimitBar(id="rate-limit-bar")
         with TabbedContent(id="tabs"):
             with TabPane("Sessions", id="tab-sessions"):
                 with Vertical(id="sessions-pane"):
@@ -403,6 +486,7 @@ class TokenTrackerApp(App):
         """Pull fresh data from the DB and update all widgets."""
         totals = query_totals()
         today = query_today()
+        window = query_rolling_window(5)
         sessions = query_sessions()
         projects = query_projects()
         models = query_models()
@@ -412,6 +496,9 @@ class TokenTrackerApp(App):
 
         banner: StatsBanner = self.query_one("#stats-banner", StatsBanner)
         banner.update_stats(totals, today)
+
+        rate_bar: RateLimitBar = self.query_one("#rate-limit-bar", RateLimitBar)
+        rate_bar.update_bar(window, get_plan(), get_limit())
 
         sess_table: SessionsTable = self.query_one("#sessions-table", SessionsTable)
         sess_table.populate(sessions)
@@ -426,6 +513,10 @@ class TokenTrackerApp(App):
         chart.populate(daily)
 
     def action_refresh(self) -> None:
+        self.refresh_data()
+
+    def action_cycle_plan(self) -> None:
+        cycle_plan()
         self.refresh_data()
 
     @on(DataTable.RowSelected, "#sessions-table")
@@ -451,9 +542,18 @@ def main() -> None:
         action="store_true",
         help="Rescan all Claude projects before opening the dashboard",
     )
+    parser.add_argument(
+        "--plan",
+        choices=PLANS,
+        help="Set your Claude subscription plan (pro, max5, max20)",
+    )
     args = parser.parse_args()
 
     init_db()
+
+    if args.plan:
+        set_plan(args.plan)
+        print(f"Plan set to: {PLAN_NAMES[args.plan]}")
 
     if args.ingest:
         print("Scanning all Claude Code projects …", end=" ", flush=True)

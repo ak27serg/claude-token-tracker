@@ -238,6 +238,28 @@ def query_models() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def query_rolling_window(hours: int = 5) -> dict:
+    """Token usage in the last N hours (rolling window for rate limiting)."""
+    with _conn() as con:
+        row = con.execute(
+            """
+            SELECT
+                COUNT(DISTINCT session_id) AS sessions,
+                COUNT(*)                   AS turns,
+                SUM(input_tokens)          AS input_tokens,
+                SUM(output_tokens)         AS output_tokens,
+                SUM(cache_creation_tokens) AS cache_creation_tokens,
+                SUM(cache_read_tokens)     AS cache_read_tokens,
+                SUM(cost_usd)              AS cost_usd,
+                MIN(timestamp)             AS oldest_turn
+            FROM turns
+            WHERE timestamp >= datetime('now', ?)
+            """,
+            (f"-{hours} hours",),
+        ).fetchone()
+        return dict(row) if row else {}
+
+
 def query_daily(days: int = 30) -> list[dict]:
     """Daily aggregates for the last N days."""
     with _conn() as con:
